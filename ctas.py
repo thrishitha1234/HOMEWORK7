@@ -34,7 +34,7 @@ default_args = {
 
 # Define the DAG
 with DAG(
-    dag_id='ctas',  # Changed DAG name to 'ctas'
+    dag_id='BuildELT_CTAS',  
     default_args=default_args,
     schedule_interval=None,  # Run on-demand or adjust as needed
     catchup=False
