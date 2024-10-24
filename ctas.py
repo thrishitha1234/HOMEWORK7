@@ -10,69 +10,152 @@ Original file is located at
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import snowflake.connector
 
-# Function to establish a Snowflake connection using snowflake.connector
-def return_snowflake_conn():
-    # Retrieve Snowflake credentials from Airflow Variables
-    user_id = Variable.get('snowflake_username')
-    password = Variable.get('snowflake_password')
-    account = Variable.get('snowflake_account')
-
-    # Establish a connection to Snowflake
-    conn = snowflake.connector.connect(
-        user=user_id,
-        password=password,
-        account=account,
-        warehouse='compute_wh',
-        database='dev',
-        schema='raw_data'
+def get_snowflake_conn():
+    return snowflake.connector.connect(
+        account=Variable.get("snowflake_account"),
+        user=Variable.get("snowflake_username"),
+        password=Variable.get("snowflake_password"),
+        warehouse=Variable.get("snowflake_warehouse", "compute_wh"),
+        database="dev",
+        schema="raw_data"
     )
-    return conn.cursor()
 
-@task
-def run_ctas(table, select_sql, primary_key=None):
-    logging.info(f"Creating table {table} with query: {select_sql}")
-
-    cur = return_snowflake_conn()
-
-    try:
-        cur.execute("BEGIN;")
-        sql = f"CREATE OR REPLACE TABLE {table} AS {select_sql}"
-        logging.info(sql)
-        cur.execute(sql)
-
-        # Check for primary key uniqueness if specified
-        if primary_key is not None:
-            sql = f"SELECT {primary_key}, COUNT(1) AS cnt FROM {table} GROUP BY 1 ORDER BY 2 DESC LIMIT 1"
-            logging.info(sql)
-            cur.execute(sql)
-            result = cur.fetchone()
-            if int(result[1]) > 1:
-                raise Exception(f"Primary key uniqueness failed: {result}")
-
-        cur.execute("COMMIT;")
-    except Exception as e:
-        cur.execute("ROLLBACK;")
-        logging.error('Failed to execute SQL. Completed ROLLBACK!')
-        raise e
-    finally:
-        cur.close()
+# Default DAG arguments
+default_args = {
+    'owner': 'Lab1',
+    'start_date': datetime(2023, 1, 1),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
 
 # Define the DAG
 with DAG(
-    dag_id='BuildELT_CTAS',
-    start_date=datetime(2024, 10, 2),
-    catchup=False,
-    tags=['ELT'],
-    schedule_interval='45 2 * * *'  # Run daily at 2:45 AM
+    dag_id='ctas',  # Changed DAG name to 'ctas'
+    default_args=default_args,
+    schedule_interval=None,  # Run on-demand or adjust as needed
+    catchup=False
 ) as dag:
 
-    table = "dev.analytics.session_summary"
-    select_sql = """SELECT u.*, s.ts
-                    FROM dev.raw_data.user_session_channel u
-                    JOIN dev.raw_data.session_timestamp s ON u.sessionId=s.sessionId"""
+    @task
+    def create_tables():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Create the user_session_channel table
+            create_user_session_table = """
+            CREATE TABLE IF NOT EXISTS raw_data.user_session_channel (
+                userId int NOT NULL,
+                sessionId varchar(32) PRIMARY KEY,
+                channel varchar(32) DEFAULT 'direct'
+            );
+            """
+            cur.execute(create_user_session_table)
+            logging.info("Table raw_data.user_session_channel created successfully.")
 
-    run_ctas(table, select_sql, primary_key='sessionId')
+            # Create the session_timestamp table
+            create_session_timestamp_table = """
+            CREATE TABLE IF NOT EXISTS raw_data.session_timestamp (
+                sessionId varchar(32) PRIMARY KEY,
+                ts timestamp
+            );
+            """
+            cur.execute(create_session_timestamp_table)
+            logging.info("Table raw_data.session_timestamp created successfully.")
+        except Exception as e:
+            logging.error(f"Error creating tables: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    @task
+    def set_stage():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Create a stage for CSV data
+            create_stage = """
+            CREATE OR REPLACE STAGE raw_data.blob_stage
+            url = 's3://s3-geospatial/readonly/'
+            file_format = (type = csv, skip_header = 1, field_optionally_enclosed_by = '"');
+            """
+            cur.execute(create_stage)
+            logging.info("Stage raw_data.blob_stage created successfully.")
+        except Exception as e:
+            logging.error(f"Error creating stage: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    @task
+    def load_data():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Copy data into user_session_channel
+            copy_user_session_channel = """
+            COPY INTO raw_data.user_session_channel
+            FROM @raw_data.blob_stage/user_session_channel.csv;
+            """
+            cur.execute(copy_user_session_channel)
+            logging.info("Data copied into raw_data.user_session_channel successfully.")
+
+            # Copy data into session_timestamp
+            copy_session_timestamp = """
+            COPY INTO raw_data.session_timestamp
+            FROM @raw_data.blob_stage/session_timestamp.csv;
+            """
+            cur.execute(copy_session_timestamp)
+            logging.info("Data copied into raw_data.session_timestamp successfully.")
+        except Exception as e:
+            logging.error(f"Error loading data: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    @task
+    def create_session_summary():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Switch to analytics schema
+            cur.execute("USE SCHEMA analytics")
+
+            # Create the session_summary table with the requested columns
+            create_session_summary_table = """
+            CREATE TABLE IF NOT EXISTS analytics.session_summary AS
+            SELECT
+                usc.userId,
+                usc.sessionId,
+                usc.channel,
+                st.ts
+            FROM
+                raw_data.user_session_channel usc
+            JOIN
+                raw_data.session_timestamp st
+            ON
+                usc.sessionId = st.sessionId;
+            """
+            cur.execute(create_session_summary_table)
+            logging.info("Table analytics.session_summary created successfully with columns userId, sessionId, channel, and ts.")
+        except Exception as e:
+            logging.error(f"Error creating session summary: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    # Task definitions
+    create_tables_task = create_tables()
+    set_stage_task = set_stage()
+    load_data_task = load_data()
+    create_session_summary_task = create_session_summary()
+
+    # Task dependencies
+    create_tables_task >> set_stage_task >> load_data_task >> create_session_summary_task
